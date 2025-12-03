@@ -45,27 +45,39 @@ const inFlightRefresh = new Map<string, Promise<ModelRecord>>()
  * Compute a cache key from provider options. Includes baseUrl and apiKey so
  * different profiles/configs do not share the same cache entry.
  */
-function computeCacheKey(options: GetModelsOptions): string {
+function sanitizeProfileName(name: string): string {
+	return name.replace(/[^a-zA-Z0-9-_]/g, "_").slice(0, 64)
+}
+
+function computeCacheParts(options: GetModelsOptions): { key: string; profileName?: string } {
 	const provider = options.provider
 	const base = options.baseUrl ?? ""
-	const key = `${provider}|${base}|${options.apiKey ?? ""}`
-	return key
+	// profileName may not be part of GetModelsOptions type; access dynamically
+	const rawProfile = (options as any)?.profileName as string | undefined
+	const profileName = rawProfile ? sanitizeProfileName(rawProfile) : undefined
+	const apiHash = options.apiKey ? crypto.createHash("sha1").update(options.apiKey).digest("hex") : ""
+	const key = `${provider}|${profileName ?? ""}|${base}|${apiHash}`
+	return { key, profileName }
 }
 
 function computeHash(key: string) {
 	return crypto.createHash("sha1").update(key).digest("hex")
 }
 
-async function writeModels(provider: RouterName, cacheKey: string, data: ModelRecord) {
+async function writeModels(provider: RouterName, cacheKey: string, data: ModelRecord, profileName?: string) {
 	const hash = computeHash(cacheKey)
-	const filename = `${provider}_${hash}_models.json`
+	const filename = profileName && profileName.length
+		? `${provider}_${profileName}_${hash}_models.json`
+		: `${provider}_${hash}_models.json`
 	const cacheDir = await getCacheDirectoryPath(ContextProxy.instance.globalStorageUri.fsPath)
 	await safeWriteJson(path.join(cacheDir, filename), data)
 }
 
-async function readModels(provider: RouterName, cacheKey: string): Promise<ModelRecord | undefined> {
+async function readModels(provider: RouterName, cacheKey: string, profileName?: string): Promise<ModelRecord | undefined> {
 	const hash = computeHash(cacheKey)
-	const filename = `${provider}_${hash}_models.json`
+	const filename = profileName && profileName.length
+		? `${provider}_${profileName}_${hash}_models.json`
+		: `${provider}_${hash}_models.json`
 	const cacheDir = await getCacheDirectoryPath(ContextProxy.instance.globalStorageUri.fsPath)
 	const filePath = path.join(cacheDir, filename)
 	const exists = await fileExistsAtPath(filePath)
@@ -76,7 +88,7 @@ async function readModels(provider: RouterName, cacheKey: string): Promise<Model
  * Internal helper: check memory cache then disk for a specific cacheKey.
  * This keeps profile-scoped cache separate from legacy provider-only cache.
  */
-function getModelsFromCacheForKey(cacheKey: string, provider: ProviderName): ModelRecord | undefined {
+function getModelsFromCacheForKey(cacheKey: string, provider: ProviderName, profileName?: string): ModelRecord | undefined {
 	// Memory cache first
 	const memoryModels = memoryCache.get<ModelRecord>(cacheKey)
 	if (memoryModels) {
@@ -85,18 +97,36 @@ function getModelsFromCacheForKey(cacheKey: string, provider: ProviderName): Mod
 
 	// Disk cache: synchronous read for callers that expect sync behavior
 	try {
-		const hash = computeHash(cacheKey)
-		const filename = `${provider}_${hash}_models.json`
 		const cacheDir = getCacheDirectoryPathSync()
 		if (!cacheDir) return undefined
 
+		// Prefer profile-scoped filename when profileName is present
+		const filenamePref = profileName && profileName.length ? `${provider}_${profileName}_models.json` : undefined
+		if (filenamePref) {
+			const filePath = path.join(cacheDir, filenamePref)
+			if (fsSync.existsSync(filePath)) {
+				const data = fsSync.readFileSync(filePath, "utf8")
+				const models = JSON.parse(data)
+				const validation = modelRecordSchema.safeParse(models)
+				if (!validation.success) {
+					console.error(`[MODEL_CACHE] Invalid disk cache data structure for ${provider} (profile ${profileName}):`, validation.error.format())
+				} else {
+					memoryCache.set(cacheKey, validation.data)
+					return validation.data
+				}
+			}
+		}
+
+		// Fallback to hashed filename
+		const hash = computeHash(cacheKey)
+		const filename = `${provider}_${hash}_models.json`
 		const filePath = path.join(cacheDir, filename)
 		if (fsSync.existsSync(filePath)) {
 			const data = fsSync.readFileSync(filePath, "utf8")
 			const models = JSON.parse(data)
 			const validation = modelRecordSchema.safeParse(models)
 			if (!validation.success) {
-				console.error(`[MODEL_CACHE] Invalid disk cache data structure for ${provider} (profile-scoped):`, validation.error.format())
+				console.error(`[MODEL_CACHE] Invalid disk cache data structure for ${provider}:`, validation.error.format())
 				return undefined
 			}
 
@@ -192,9 +222,9 @@ async function fetchModelsFromProvider(options: GetModelsOptions): Promise<Model
 export const getModels = async (options: GetModelsOptions): Promise<ModelRecord> => {
 	const { provider } = options
 
-	const cacheKey = computeCacheKey(options)
+	const { key: cacheKey, profileName } = computeCacheParts(options)
 
-	let models = getModelsFromCacheForKey(cacheKey, provider)
+	let models = getModelsFromCacheForKey(cacheKey, provider, profileName)
 
 	if (models) {
 		return models
@@ -209,7 +239,7 @@ export const getModels = async (options: GetModelsOptions): Promise<ModelRecord>
 		if (modelCount > 0) {
 			memoryCache.set(cacheKey, models)
 
-			await writeModels(provider, cacheKey, models).catch((err) =>
+			await writeModels(provider, cacheKey, models, profileName).catch((err) =>
 				console.error(`[MODEL_CACHE] Error writing ${provider} models to file cache:`, err),
 			)
 		} else {
@@ -240,7 +270,7 @@ export const getModels = async (options: GetModelsOptions): Promise<ModelRecord>
  */
 export const refreshModels = async (options: GetModelsOptions): Promise<ModelRecord> => {
 	const { provider } = options
-	const cacheKey = computeCacheKey(options)
+	const { key: cacheKey, profileName } = computeCacheParts(options)
 
 	// Check if there's already an in-flight refresh for this provider+profile
 	const existingRequest = inFlightRefresh.get(cacheKey)
@@ -256,7 +286,7 @@ export const refreshModels = async (options: GetModelsOptions): Promise<ModelRec
 			const modelCount = Object.keys(models).length
 
 			// Get existing cached data for comparison
-			const existingCache = getModelsFromCacheForKey(cacheKey, provider)
+				    const existingCache = getModelsFromCacheForKey(cacheKey, provider, profileName)
 			const existingCount = existingCache ? Object.keys(existingCache).length : 0
 
 			if (modelCount === 0) {
@@ -277,7 +307,7 @@ export const refreshModels = async (options: GetModelsOptions): Promise<ModelRec
 			memoryCache.set(cacheKey, models)
 
 			// Atomically write to disk (safeWriteJson handles atomic writes)
-			await writeModels(provider, cacheKey, models).catch((err) =>
+			await writeModels(provider, cacheKey, models, profileName).catch((err) =>
 				console.error(`[refreshModels] Error writing ${provider} models to disk:`, err),
 			)
 
@@ -285,7 +315,7 @@ export const refreshModels = async (options: GetModelsOptions): Promise<ModelRec
 		} catch (error) {
 			// Log the error for debugging, then return existing cache if available (graceful degradation)
 			console.error(`[refreshModels] Failed to refresh ${provider} models:`, error)
-			return getModelsFromCacheForKey(cacheKey, provider) || {}
+			return getModelsFromCacheForKey(cacheKey, provider, profileName) || {}
 		} finally {
 			// Always clean up the in-flight tracking
 			inFlightRefresh.delete(cacheKey)
